@@ -1,245 +1,254 @@
 """
-sheet_generator.py — Gerador de gabaritos OMR em PDF.
+sheet_generator.py — Gerador de gabaritos PDF template ACAFE.
 
-Gera folhas de respostas com:
-  - QR Code (template_id + student_id)
-  - Fiduciais de canto (quadrados 8mm pretos nos 4 cantos)
-  - Marcadores internos (quadrados 4mm pretos no topo/meio/base de cada bloco)
-  - Grade de bolhas organizadas em blocos/colunas
-  - Cabeçalho com dados do aluno e nome da prova
-
-Templates suportados:
-  - ACAFE: 63 questões, 4 alternativas (A, B, C, D), 4 blocos de ~16q
-  - UFSC:  82 questões, 5 alternativas somatório (01, 02, 04, 08, 16)
-  - ENEM:  180 questões, 5 alternativas (A, B, C, D, E)
+Usa coordenadas exatas de app.config.
+ReportLab: pontos (1pt = 1/72 in), origem BOTTOM-LEFT.
+config: mm, origem TOP-LEFT.
 """
-
-from __future__ import annotations
 
 import io
 import json
-import math
 from typing import Optional
 
 import qrcode
-from PIL import Image as PILImage
-from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+
+from app.config import (
+    ALTERNATIVES,
+    BLOCK_A_X_MM,
+    BLOCK_QUESTION_COUNTS,
+    BUBBLE_RADIUS_MM,
+    BUBBLE_SPACING_X_MM,
+    FIDUCIAL_CENTERS_MM,
+    FIDUCIAL_SIZE_MM,
+    FIRST_ROW_Y_MM,
+    FOREIGN_LANGUAGES,
+    LANG_AREA_Y_MM,
+    LANG_BUBBLE_RADIUS_MM,
+    LANG_BUBBLE_SPACING_MM,
+    LANG_BUBBLE_X_START_MM,
+    PAGE_H_MM,
+    PAGE_W_MM,
+    ROW_SPACING_Y_MM,
+    get_all_bubble_centers_mm,
+    get_language_centers_mm,
+)
+
+# Conversão mm → pontos ReportLab
+_PT = 72.0 / 25.4
 
 
-# ─── Constantes de layout ─────────────────────────────────────────────────────
-# Devem bater com omr_reader.py
-FIDUCIAL_SIZE = 8 * mm        # Quadrado preto nos cantos (referência geométrica)
-INNER_MARKER_SIZE = 4 * mm    # Quadrado preto de calibração nos blocos
-
-BUBBLE_RADIUS = 3.5 * mm      # Raio das bolhas
-BUBBLE_SPACING = 8.5 * mm     # Espaçamento horizontal entre centros de bolhas
-ROW_SPACING = 8.0 * mm        # Espaçamento vertical entre linhas de questões
-
-PAGE_MARGIN = 15 * mm          # Margem da página
-HEADER_HEIGHT = 75 * mm        # Altura reservada para cabeçalho + QR
-
-QUESTIONS_PER_BLOCK = 20       # Máximo de questões por coluna/bloco
+def _pt(v):
+    """mm para pontos."""
+    return v * _PT
 
 
-# ─── Função principal ─────────────────────────────────────────────────────────
+def _y(y_mm):
+    """Flip Y: top-left (config) → bottom-left (ReportLab), em mm."""
+    return PAGE_H_MM - y_mm
+
 
 def generate_sheet_for_student(
-    template_id: str,
-    template_name: str,
-    exam_type: str,
-    total_questions: int,
-    alternatives: list[str],
-    student: dict,
-    questions_meta: Optional[list[dict]] = None,
+    template_type: str = "ACAFE",
+    student_id: str = "",
+    student_name: str = "",
+    student_sede: str = "",
+    template_id: Optional[str] = None,
 ) -> bytes:
-    """
-    Gera o PDF do gabarito OMR para um estudante.
+    """Gera PDF de gabarito. Retorna bytes."""
 
-    Retorna os bytes do PDF.
-    """
     buf = io.BytesIO()
-    page_w, page_h = A4  # 210mm × 297mm
+    c = canvas.Canvas(buf, pagesize=(_pt(PAGE_W_MM), _pt(PAGE_H_MM)))
 
-    c = canvas.Canvas(buf, pagesize=A4)
-    c.setTitle(f"Gabarito {template_name} - {student.get('name', 'Aluno')}")
-
-    # ── Fiduciais de canto (4 quadrados pretos nos cantos) ────────────────────
-    _draw_fiducials(c, page_w, page_h)
-
-    # ── QR Code ───────────────────────────────────────────────────────────────
-    qr_data = json.dumps({
-        "tid": template_id,
-        "sid": student.get("student_id") or student.get("id", ""),
-        "et": exam_type,
-    }, separators=(",", ":"))
-    _draw_qr_code(c, qr_data, page_w)
-
-    # ── Cabeçalho ─────────────────────────────────────────────────────────────
-    _draw_header(c, page_w, page_h, template_name, exam_type, student)
-
-    # ── Grade de bolhas ───────────────────────────────────────────────────────
-    n_blocks = math.ceil(total_questions / QUESTIONS_PER_BLOCK)
-    usable_width = page_w - 2 * PAGE_MARGIN - FIDUCIAL_SIZE
-    block_width = usable_width / n_blocks
-
-    # Origem Y da grade (abaixo do header)
-    grid_top_y = page_h - HEADER_HEIGHT
-
-    for block_idx in range(n_blocks):
-        x_col = PAGE_MARGIN + FIDUCIAL_SIZE / 2 + block_idx * block_width
-
-        # Marcador interno de TOPO (centro horizontal do bloco)
-        marker_x = x_col + 14 * mm + (len(alternatives) - 1) * BUBBLE_SPACING / 2
-        marker_y_top = grid_top_y + INNER_MARKER_SIZE / 2 + 2 * mm
-        c.setFillColorRGB(0, 0, 0)
-        c.rect(
-            marker_x - INNER_MARKER_SIZE / 2,
-            marker_y_top - INNER_MARKER_SIZE / 2,
-            INNER_MARKER_SIZE,
-            INNER_MARKER_SIZE,
-            fill=1, stroke=0,
-        )
-
-        # Questões deste bloco
-        q_start = block_idx * QUESTIONS_PER_BLOCK + 1
-        q_end = min(q_start + QUESTIONS_PER_BLOCK - 1, total_questions)
-
-        for q_offset, q_num in enumerate(range(q_start, q_end + 1)):
-            row_y = grid_top_y - (q_offset + 1) * ROW_SPACING
-
-            # Número da questão
-            c.setFillColorRGB(0, 0, 0)
-            c.setFont("Helvetica", 7)
-            q_label = f"{q_num:02d}"
-            c.drawRightString(x_col + 10 * mm, row_y - 2, q_label)
-
-            # Bolhas
-            for alt_idx, alt_label in enumerate(alternatives):
-                bx = x_col + 14 * mm + alt_idx * BUBBLE_SPACING
-                by = row_y
-
-                # Bolha vazia (círculo cinza claro)
-                c.setStrokeColorRGB(0.3, 0.3, 0.3)
-                c.setFillColorRGB(1, 1, 1)
-                c.circle(bx, by, BUBBLE_RADIUS, fill=1, stroke=1)
-
-                # Letra da alternativa dentro da bolha
-                c.setFillColorRGB(0.5, 0.5, 0.5)
-                c.setFont("Helvetica", 6)
-                c.drawCentredString(bx, by - 2, alt_label)
-
-        # Marcador interno de MEIO (se bloco tem ≥10 questões)
-        if q_end - q_start + 1 >= 10:
-            mid_row = (q_end - q_start) // 2
-            marker_y_mid = grid_top_y - (mid_row + 1) * ROW_SPACING
-            c.setFillColorRGB(0, 0, 0)
-            c.rect(
-                marker_x - INNER_MARKER_SIZE / 2,
-                marker_y_mid - INNER_MARKER_SIZE / 2,
-                INNER_MARKER_SIZE,
-                INNER_MARKER_SIZE,
-                fill=1, stroke=0,
-            )
-
-        # Marcador interno de BASE
-        last_row_y = grid_top_y - (q_end - q_start + 1) * ROW_SPACING
-        marker_y_bot = last_row_y - ROW_SPACING / 2
-        c.setFillColorRGB(0, 0, 0)
-        c.rect(
-            marker_x - INNER_MARKER_SIZE / 2,
-            marker_y_bot - INNER_MARKER_SIZE / 2,
-            INNER_MARKER_SIZE,
-            INNER_MARKER_SIZE,
-            fill=1, stroke=0,
-        )
-
-    # ── Rodapé ────────────────────────────────────────────────────────────────
-    c.setFont("Helvetica", 6)
-    c.setFillColorRGB(0.5, 0.5, 0.5)
-    c.drawCentredString(page_w / 2, 10 * mm,
-                        f"Colégio Fleming — {template_name} — Preencha com caneta preta")
-
-    c.save()
-    return buf.getvalue()
-
-
-# ─── Fiduciais de canto ───────────────────────────────────────────────────────
-
-def _draw_fiducials(c: canvas.Canvas, page_w: float, page_h: float):
-    """Desenha 4 quadrados pretos nos cantos como referência geométrica."""
-    margin = PAGE_MARGIN / 2
-    positions = [
-        (margin, page_h - margin - FIDUCIAL_SIZE),                          # top-left
-        (page_w - margin - FIDUCIAL_SIZE, page_h - margin - FIDUCIAL_SIZE), # top-right
-        (margin, margin),                                                    # bottom-left
-        (page_w - margin - FIDUCIAL_SIZE, margin),                          # bottom-right
-    ]
+    # =================================================================
+    # 1. FIDUCIAIS — 4 quadrados pretos nos cantos
+    # =================================================================
+    half = FIDUCIAL_SIZE_MM / 2
     c.setFillColorRGB(0, 0, 0)
-    for x, y in positions:
-        c.rect(x, y, FIDUCIAL_SIZE, FIDUCIAL_SIZE, fill=1, stroke=0)
+    for fx, fy in FIDUCIAL_CENTERS_MM:
+        c.rect(
+            _pt(fx - half), _pt(_y(fy) - half),
+            _pt(FIDUCIAL_SIZE_MM), _pt(FIDUCIAL_SIZE_MM),
+            stroke=0, fill=1,
+        )
 
-
-# ─── QR Code ──────────────────────────────────────────────────────────────────
-
-def _draw_qr_code(c: canvas.Canvas, data: str, page_w: float):
-    """Gera e desenha o QR Code no canto superior direito."""
-    qr = qrcode.QRCode(version=1, box_size=10, border=2)
-    qr.add_data(data)
-    qr.make(fit=True)
-    qr_img = qr.make_image(fill_color="black", back_color="white")
-
-    # Converter para bytes
-    img_buf = io.BytesIO()
-    qr_img.save(img_buf, format="PNG")
-    img_buf.seek(0)
-
-    from reportlab.lib.utils import ImageReader
-    qr_size = 30 * mm
-    x = page_w - PAGE_MARGIN - qr_size - FIDUCIAL_SIZE
-    y = A4[1] - PAGE_MARGIN - FIDUCIAL_SIZE - qr_size - 5 * mm
-    c.drawImage(ImageReader(img_buf), x, y, width=qr_size, height=qr_size)
-
-
-# ─── Cabeçalho ────────────────────────────────────────────────────────────────
-
-def _draw_header(
-    c: canvas.Canvas,
-    page_w: float,
-    page_h: float,
-    template_name: str,
-    exam_type: str,
-    student: dict,
-):
-    """Desenha o cabeçalho com título da prova e dados do aluno."""
-    x_start = PAGE_MARGIN + FIDUCIAL_SIZE + 5 * mm
-    y_top = page_h - PAGE_MARGIN - FIDUCIAL_SIZE - 8 * mm
-
+    # =================================================================
+    # 2. CABEÇALHO
+    # =================================================================
     # Título
-    c.setFont("Helvetica-Bold", 14)
+    c.setFont("Helvetica-Bold", 16)
     c.setFillColorRGB(0, 0, 0)
-    c.drawString(x_start, y_top, f"GABARITO — {template_name}")
+    c.drawString(_pt(15), _pt(_y(15)), f"{template_type}")
 
-    # Tipo de prova
     c.setFont("Helvetica", 9)
-    c.drawString(x_start, y_top - 16, f"Tipo: {exam_type}")
+    c.setFillColorRGB(0.4, 0.4, 0.4)
+    c.drawString(_pt(15), _pt(_y(21)), f"Tipo: {template_type}")
+    c.setFillColorRGB(0, 0, 0)
 
     # Dados do aluno
-    name = student.get("name", "—")
-    sid = student.get("student_id") or student.get("id", "—")
-    campus = student.get("campus", "")
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(_pt(15), _pt(_y(30)), "Nome:")
+    c.setFont("Helvetica", 11)
+    c.drawString(_pt(32), _pt(_y(30)), student_name)
 
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(x_start, y_top - 35, f"Aluno: {name}")
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(_pt(15), _pt(_y(36)), "Matrícula:")
+    c.setFont("Helvetica", 11)
+    c.drawString(_pt(42), _pt(_y(36)), student_id)
 
-    c.setFont("Helvetica", 9)
-    c.drawString(x_start, y_top - 50, f"Matrícula: {sid}")
-    if campus:
-        c.drawString(x_start + 80 * mm, y_top - 50, f"Campus: {campus}")
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(_pt(90), _pt(_y(36)), "Sede:")
+    c.setFont("Helvetica", 11)
+    c.drawString(_pt(103), _pt(_y(36)), student_sede)
 
-    # Linha separadora
-    c.setStrokeColorRGB(0.7, 0.7, 0.7)
-    c.setLineWidth(0.5)
-    sep_y = y_top - 60
-    c.line(PAGE_MARGIN, sep_y, page_w - PAGE_MARGIN, sep_y)
+    # =================================================================
+    # 3. QR CODE (canto superior direito)
+    # =================================================================
+    qr_data = json.dumps({
+        "tid": template_id or f"{template_type}_default",
+        "sid": student_id,
+        "tpl": template_type,
+    })
+    qr_img = qrcode.make(qr_data, box_size=3, border=1)
+    qr_buf = io.BytesIO()
+    qr_img.save(qr_buf, format="PNG")
+    qr_buf.seek(0)
+
+    qr_size = 22  # mm
+    qr_x = PAGE_W_MM - 15 - qr_size
+    qr_y = 10
+    c.drawImage(
+        ImageReader(qr_buf),
+        _pt(qr_x), _pt(_y(qr_y) - qr_size),
+        width=_pt(qr_size), height=_pt(qr_size),
+    )
+    c.setFont("Helvetica", 6)
+    c.setFillColorRGB(0.5, 0.5, 0.5)
+    c.drawCentredString(
+        _pt(qr_x + qr_size / 2),
+        _pt(_y(qr_y + qr_size + 2)),
+        "Gabarito OMR",
+    )
+    c.setFillColorRGB(0, 0, 0)
+
+    # =================================================================
+    # 4. LÍNGUA ESTRANGEIRA (área separada, abaixo dos dados do aluno)
+    # =================================================================
+    # Linha separadora fina
+    c.setStrokeColorRGB(0.75, 0.75, 0.75)
+    c.setLineWidth(0.4)
+    c.line(_pt(15), _pt(_y(44)), _pt(PAGE_W_MM - 15), _pt(_y(44)))
+
+    c.setFont("Helvetica-Bold", 9)
+    c.setFillColorRGB(0, 0, 0)
+    c.drawString(_pt(15), _pt(_y(LANG_AREA_Y_MM)), "Língua Estrangeira:")
+
+    lang_centers = get_language_centers_mm()
+    for lang, (lx, ly) in lang_centers.items():
+        # Bolha
+        c.setStrokeColorRGB(0, 0, 0)
+        c.setLineWidth(0.6)
+        c.setFillColorRGB(1, 1, 1)
+        c.circle(_pt(lx), _pt(_y(ly)), _pt(LANG_BUBBLE_RADIUS_MM), stroke=1, fill=1)
+        # Label ao lado
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont("Helvetica", 8.5)
+        c.drawString(
+            _pt(lx + LANG_BUBBLE_RADIUS_MM + 2),
+            _pt(_y(ly)) - 3,
+            lang,
+        )
+
+    # =================================================================
+    # 5. INSTRUÇÕES
+    # =================================================================
+    inst_y = 57.0
+    c.setStrokeColorRGB(0.75, 0.75, 0.75)
+    c.setLineWidth(0.4)
+    c.line(_pt(15), _pt(_y(inst_y)), _pt(PAGE_W_MM - 15), _pt(_y(inst_y)))
+
+    c.setFont("Helvetica-Bold", 9)
+    c.setFillColorRGB(0, 0, 0)
+    c.drawString(_pt(15), _pt(_y(inst_y + 5)), "INSTRUÇÕES:")
+
+    c.setFont("Helvetica", 7.5)
+    instrucoes = [
+        "Use caneta esferográfica azul ou preta.",
+        "Preencha completamente a bolha correspondente à sua resposta.",
+        "Não rasure. Em caso de erro, solicite uma nova folha ao aplicador.",
+        "Preencha apenas UMA bolha por questão.",
+    ]
+    for i, txt in enumerate(instrucoes):
+        c.drawString(_pt(17), _pt(_y(inst_y + 10 + i * 4)), f"• {txt}")
+
+    # =================================================================
+    # 6. CABEÇALHOS DOS BLOCOS (Q, A, B, C, D)
+    # =================================================================
+    label_y = FIRST_ROW_Y_MM - ROW_SPACING_Y_MM * 0.6
+
+    for block_idx in range(len(BLOCK_QUESTION_COUNTS)):
+        base_x = BLOCK_A_X_MM[block_idx]
+
+        # "Q"
+        c.setFont("Helvetica-Bold", 6)
+        c.setFillColorRGB(0.3, 0.3, 0.3)
+        c.drawRightString(_pt(base_x - 4), _pt(_y(label_y)), "Q")
+
+        # Letras A B C D
+        c.setFont("Helvetica-Bold", 7)
+        c.setFillColorRGB(0, 0, 0)
+        for ai, alt in enumerate(ALTERNATIVES):
+            x = base_x + ai * BUBBLE_SPACING_X_MM
+            c.drawCentredString(_pt(x), _pt(_y(label_y)), alt)
+
+    # =================================================================
+    # 7. NÚMEROS DAS QUESTÕES
+    # =================================================================
+    c.setFont("Helvetica", 7)
+    c.setFillColorRGB(0.3, 0.3, 0.3)
+    q_num = 1
+    for bi, count in enumerate(BLOCK_QUESTION_COUNTS):
+        base_x = BLOCK_A_X_MM[bi]
+        for row in range(count):
+            y_mm = FIRST_ROW_Y_MM + row * ROW_SPACING_Y_MM
+            c.drawRightString(_pt(base_x - 4), _pt(_y(y_mm)) - 2, str(q_num))
+            q_num += 1
+
+    # =================================================================
+    # 8. BOLHAS DE RESPOSTA (posições exatas do config)
+    # =================================================================
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setLineWidth(0.6)
+    c.setFillColorRGB(1, 1, 1)
+
+    for q, alts in get_all_bubble_centers_mm().items():
+        for alt, (x_mm, y_mm) in alts.items():
+            c.circle(
+                _pt(x_mm), _pt(_y(y_mm)),
+                _pt(BUBBLE_RADIUS_MM),
+                stroke=1, fill=1,
+            )
+
+    # =================================================================
+    # 9. SEPARADORES VERTICAIS ENTRE BLOCOS
+    # =================================================================
+    c.setStrokeColorRGB(0.85, 0.85, 0.85)
+    c.setLineWidth(0.3)
+    for bi in range(1, len(BLOCK_QUESTION_COUNTS)):
+        sep_x = (
+            BLOCK_A_X_MM[bi - 1]
+            + (len(ALTERNATIVES) - 1) * BUBBLE_SPACING_X_MM
+            + BLOCK_A_X_MM[bi]
+        ) / 2
+        y_top = FIRST_ROW_Y_MM - ROW_SPACING_Y_MM
+        y_bot = FIRST_ROW_Y_MM + 19 * ROW_SPACING_Y_MM + ROW_SPACING_Y_MM * 0.5
+        c.line(_pt(sep_x), _pt(_y(y_top)), _pt(sep_x), _pt(_y(y_bot)))
+
+    # =================================================================
+    # FINALIZAR
+    # =================================================================
+    c.showPage()
+    c.save()
+    return buf.getvalue()
