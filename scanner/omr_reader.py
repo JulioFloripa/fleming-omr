@@ -88,73 +88,56 @@ def decode_qr(gray: np.ndarray) -> Optional[dict]:
 def _find_fiducials(gray: np.ndarray) -> Optional[np.ndarray]:
     """
     Encontra os 4 quadrados pretos de canto na imagem.
-    Retorna array 4×2 com centros [TL, TR, BL, BR] ou None.
+    Busca APENAS nas regioes de canto (20% de cada borda).
+    Se 1 canto faltante, estima dos outros 3.
     """
     h, w = gray.shape
-
-    # Threshold agressivo para isolar preto forte
     _, binary = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
-
-    # Limpar ruído
     kernel = np.ones((3, 3), np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
     cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # Tamanho esperado dos fiduciais (proporcional à imagem)
     min_side = int(min(w, h) * 0.01)
     max_side = int(min(w, h) * 0.06)
-
     candidates = []
     for cnt in cnts:
         x, y, cw, ch = cv2.boundingRect(cnt)
-        if cw < min_side or ch < min_side:
-            continue
-        if cw > max_side or ch > max_side:
-            continue
-        # Aspecto quadrado
+        if cw < min_side or ch < min_side: continue
+        if cw > max_side or ch > max_side: continue
         aspect = cw / ch
-        if aspect < 0.5 or aspect > 2.0:
-            continue
-        # Solidez (área / bounding rect)
+        if aspect < 0.5 or aspect > 2.0: continue
         area = cv2.contourArea(cnt)
-        if area < cw * ch * 0.6:
-            continue
+        if area < cw * ch * 0.6: continue
         cx = x + cw // 2
         cy = y + ch // 2
         candidates.append((cx, cy, area))
-
-    if len(candidates) < 4:
-        return None
-
-    # Selecionar os 4 candidatos mais próximos dos cantos
-    corners = [
-        (0, 0),      # TL
-        (w, 0),      # TR
-        (0, h),      # BL
-        (w, h),      # BR
-    ]
-    result = []
-    used = set()
-    for cx_corner, cy_corner in corners:
-        best_idx = -1
-        best_dist = float('inf')
-        for i, (cx, cy, _) in enumerate(candidates):
-            if i in used:
-                continue
-            dist = (cx - cx_corner) ** 2 + (cy - cy_corner) ** 2
-            if dist < best_dist:
-                best_dist = dist
-                best_idx = i
-        if best_idx >= 0:
-            result.append(candidates[best_idx][:2])
-            used.add(best_idx)
-
-    if len(result) != 4:
-        return None
-
-    return np.array(result, dtype=np.float32)
+    margin_x = int(w * 0.20)
+    margin_y = int(h * 0.20)
+    corner_regions = {
+        "TL": (0, 0, margin_x, margin_y),
+        "TR": (w - margin_x, 0, w, margin_y),
+        "BL": (0, h - margin_y, margin_x, h),
+        "BR": (w - margin_x, h - margin_y, w, h),
+    }
+    found = {}
+    for name, (x1, y1, x2, y2) in corner_regions.items():
+        best = None
+        best_area = 0
+        for cx, cy, area in candidates:
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                if area > best_area:
+                    best = (cx, cy)
+                    best_area = area
+        if best is not None:
+            found[name] = best
+    if len(found) < 3: return None
+    if len(found) == 3:
+        missing = [k for k in ["TL", "TR", "BL", "BR"] if k not in found][0]
+        if missing == "TL": found["TL"] = (found["BL"][0], found["TR"][1])
+        elif missing == "TR": found["TR"] = (found["BR"][0], found["TL"][1])
+        elif missing == "BL": found["BL"] = (found["TL"][0], found["BR"][1])
+        elif missing == "BR": found["BR"] = (found["TR"][0], found["BL"][1])
+    return np.array([found["TL"], found["TR"], found["BL"], found["BR"]], dtype=np.float32)
 
 
 # =============================================================================
